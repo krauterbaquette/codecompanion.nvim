@@ -16,6 +16,7 @@ M._oauth_token = nil
 
 ---@type CopilotToken|nil
 M._copilot_token = nil
+M._adapter_opts = {}
 
 -- Lock to prevent concurrent token requests
 local _token_fetch_in_progress = false
@@ -23,8 +24,17 @@ local _token_wait_timeout = 5000 -- ms
 local _token_wait_interval = 50 -- ms
 
 ---Finds the path where the token is stored
+---@param adapter_opts? table
 ---@return string|nil
-local function find_config_path()
+local function find_config_path(adapter_opts)
+  if adapter_opts and adapter_opts.copilot_config_path then
+    return vim.fs.normalize(adapter_opts.copilot_config_path)
+  end
+
+  if os.getenv("COPILOT_HOME") then
+    return vim.fs.joinpath(os.getenv("COPILOT_HOME"), "config.json")
+  end
+
   if os.getenv("CODECOMPANION_TOKEN_PATH") then
     return os.getenv("CODECOMPANION_TOKEN_PATH")
   end
@@ -38,10 +48,40 @@ local function find_config_path()
     if vim.fn.isdirectory(path) > 0 then
       return path
     end
+
   else
     path = vim.fs.normalize("~/.config")
     if vim.fn.isdirectory(path) > 0 then
       return path
+    end
+
+  end
+end
+
+---@param value unknown
+---@return string|nil
+local function find_cli_token(value)
+  if type(value) ~= "table" then
+    return nil
+  end
+
+  local token_keys = {
+    access_token = true,
+    accessToken = true,
+    github_token = true,
+    githubToken = true,
+    oauth_token = true,
+    oauthToken = true,
+    token = true,
+  }
+
+  for key, child in pairs(value) do
+    if token_keys[key] and type(child) == "string" and child ~= "" then
+      return child
+    end
+    local token = find_cli_token(child)
+    if token then
+      return token
     end
   end
 end
@@ -53,23 +93,35 @@ local function get_oauth_token()
     return M._oauth_token
   end
 
-  local token = os.getenv("GITHUB_TOKEN")
+  local token = os.getenv("COPILOT_GITHUB_TOKEN") or os.getenv("GH_TOKEN")
+  token = token or os.getenv("GITHUB_TOKEN")
   local codespaces = os.getenv("CODESPACES")
-  if token and codespaces then
+  if token and (os.getenv("COPILOT_GITHUB_TOKEN") or os.getenv("GH_TOKEN") or codespaces) then
     return token
   end
 
-  local config_path = find_config_path()
+  local config_path = find_config_path(M._adapter_opts)
   if not config_path then
     return nil
   end
 
   --- 1. Try searching the JSON files for the token
 
-  local file_paths = {
-    vim.fs.joinpath(config_path, "github-copilot", "hosts.json"),
-    vim.fs.joinpath(config_path, "github-copilot", "apps.json"),
-  }
+  local file_paths
+  if config_path and config_path:match("%.json$") then
+    file_paths = { config_path }
+  else
+    file_paths = {
+      vim.fs.joinpath(config_path, "github-copilot", "hosts.json"),
+      vim.fs.joinpath(config_path, "github-copilot", "apps.json"),
+      vim.fs.joinpath(vim.fn.expand("~"), ".copilot", "config.json"),
+    }
+  end
+
+  local enterprise_host = M._adapter_opts.enterprise_uri
+    or os.getenv("COPILOT_GH_HOST")
+    or os.getenv("GH_HOST")
+  enterprise_host = enterprise_host and enterprise_host:gsub("^https?://", ""):gsub("/+$", "")
 
   for _, file_path in ipairs(file_paths) do
     if vim.uv.fs_stat(file_path) then
@@ -83,10 +135,25 @@ local function get_oauth_token()
         userdata = table.concat(userdata, " ")
       end
 
-      userdata = vim.json.decode(userdata)
-      for key, value in pairs(userdata) do
-        if string.find(key, "github.com") then
-          return value.oauth_token
+      local ok_decode, decoded = pcall(vim.json.decode, userdata)
+      if not ok_decode then
+        log:error("Copilot Adapter: Could not decode credentials from %s", file_path)
+        return nil
+      end
+
+      if M._adapter_opts.copilot_config_path
+        or os.getenv("COPILOT_HOME")
+        or file_path:match("%.copilot/config%.json$")
+        or file_path:match("/config%.json$")
+      then
+        return find_cli_token(decoded)
+      end
+
+      for key, value in pairs(decoded) do
+        if (not enterprise_host and string.find(key, "github.com"))
+          or (enterprise_host and string.find(key, enterprise_host, 1, true))
+        then
+          return type(value) == "table" and value.oauth_token or nil
         end
       end
     end
@@ -101,10 +168,18 @@ local function get_oauth_token()
       return nil
     end
 
+    local authority = enterprise_host or "github.com"
     local db_token
     vim
       .system(
-        { "sqlite3", db_path, "SELECT token_ciphertext FROM oauth_tokens WHERE auth_authority == 'github.com' LIMIT 1" },
+        {
+          "sqlite3",
+          db_path,
+          string.format(
+            "SELECT token_ciphertext FROM oauth_tokens WHERE auth_authority == '%s' LIMIT 1",
+            authority:gsub("'", "''")
+          ),
+        },
         { text = true },
         function(obj)
           db_token = vim.trim(obj.stdout)
@@ -143,7 +218,13 @@ local function get_copilot_token()
   log:trace("Authorizing GitHub Copilot token")
 
   local ok, request = pcall(function()
-    return Curl.get("https://api.github.com/copilot_internal/v2/token", {
+    local token_url = M._adapter_opts.token_url or "https://api.github.com/copilot_internal/v2/token"
+    local enterprise_uri = M._adapter_opts.enterprise_uri
+    if not M._adapter_opts.token_url and enterprise_uri then
+      token_url = enterprise_uri:gsub("/+$", "") .. "/copilot_internal/v2/token"
+    end
+
+    return Curl.get(token_url, {
       headers = {
         Authorization = "Bearer " .. (M._oauth_token or ""),
         Accept = "application/json",
@@ -180,6 +261,7 @@ end
 ---@param adapter? CodeCompanion.HTTPAdapter
 ---@return boolean success
 function M.init(adapter)
+  M._adapter_opts = (adapter and adapter.opts) or M._adapter_opts
   M._oauth_token = get_oauth_token()
   if not M._oauth_token then
     log:error("Copilot Adapter: No token found. Please refer to https://github.com/github/copilot.vim")

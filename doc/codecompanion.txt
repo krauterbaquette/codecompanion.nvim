@@ -1957,6 +1957,43 @@ the `auto` model as follows:
 <
 
 
+GITHUB COPILOT ENTERPRISE
+
+The HTTP `copilot` adapter can use a Copilot CLI login for a custom enterprise
+host. Set the enterprise URI and point the adapter at the CLI configuration
+file:
+
+>lua
+    require("codecompanion").setup({
+      adapters = {
+        http = {
+          copilot = {
+            opts = {
+              enterprise_uri = "https://github.example.com",
+              copilot_config_path = vim.fs.joinpath(vim.env.HOME, ".copilot", "config.json"),
+              -- Set this when the enterprise token endpoint differs from the
+              -- default derived from enterprise_uri.
+              token_url = "https://github.example.com/copilot_internal/v2/token",
+            },
+          },
+        },
+      },
+      interactions = {
+        chat = {
+          adapter = {
+            name = "copilot",
+            model = "claude-sonnet-4.5",
+          },
+        },
+      },
+    })
+<
+
+The configuration file is read only for the OAuth token. Do not put credentials
+directly in your Neovim configuration. Copilot usage statistics remain available
+only for the standard GitHub.com endpoint.
+
+
 LLAMA.CPP WITH --REASONING-FORMAT DEEPSEEK
 
 >lua

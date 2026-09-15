@@ -35,8 +35,10 @@ end
 ---@return table
 local function handlers(adapter)
   local model_opts = resolve_model_opts(adapter)
+  local fetched_token = token.fetch()
+  local api_endpoint = fetched_token and fetched_token.endpoints and fetched_token.endpoints.api
   if model_opts.endpoint == "responses" then
-    adapter.url = "https://api.githubcopilot.com/responses"
+    adapter.url = (api_endpoint or "https://api.githubcopilot.com") .. "/responses"
 
     local responses = require("codecompanion.adapters.http.openai_responses")
 
@@ -78,7 +80,7 @@ local function handlers(adapter)
     return responses.handlers
   end
 
-  adapter.url = "https://api.githubcopilot.com/chat/completions"
+  adapter.url = (api_endpoint or "https://api.githubcopilot.com") .. "/chat/completions"
   return require("codecompanion.adapters.http.openai").handlers
 end
 
@@ -93,6 +95,9 @@ return {
   },
   opts = {
     documents = true,
+    copilot_config_path = nil,
+    enterprise_uri = nil,
+    token_url = nil,
     stream = true,
     tools = true,
     vision = true,
@@ -144,9 +149,10 @@ return {
     ---@param self CodeCompanion.HTTPAdapter
     ---@return boolean
     setup = function(self)
+      local initialized = token.init(self)
       -- Ensure models are fetched synchronously before checking capabilities
       -- This prevents features from being disabled due to missing model info
-      local fetched_token = token.fetch({ force = true })
+      local fetched_token = token.fetch()
       if fetched_token and fetched_token.copilot_token then
         -- Force synchronous model fetch to ensure we have model capabilities
         get_models.choices(self, { token = fetched_token, async = false })
@@ -182,7 +188,7 @@ return {
         and model_opts.opts.can_form_structured_outputs
       ) or false
 
-      return token.init(self)
+      return initialized
     end,
 
     --- Use the OpenAI adapter for the bulk of the work
